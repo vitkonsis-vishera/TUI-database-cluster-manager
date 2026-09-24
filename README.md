@@ -1,4 +1,4 @@
-# 🐘 Cluster TUI
+# 🐘 Wunschpunsch: Database cluster TUI
 
 [English](#english) | [Русский](#русский)
 
@@ -40,7 +40,7 @@ Built on the modern [Charm](https://charm.sh/) ecosystem (`bubbletea`, `lipgloss
 ```bash
 # Clone repository
 git clone https://github.com/your-username/cluster-tui.git
-cd cluster-tui
+cd wunschpunsch
 
 # Download dependencies
 go mod download
@@ -49,8 +49,8 @@ go mod download
 go run main.go
 
 # Or compile binary
-go build -o cluster-tui main.go
-./cluster-tui
+go build -o wunschpunsch main.go
+./wunschpunsch
 ```
 
 ### Keybindings
@@ -87,7 +87,7 @@ Distributed under the **MIT License**.
 
 ### Обзор проекта
 
-**Cluster TUI** — это консольная утилита на языке Go, предназначенная для отслеживания состояния и управления высокодоступными кластерами **PostgreSQL** под управлением **Patroni**.
+**Wunschpunsch: Database cluster TUI** — это консольная утилита на языке Go, предназначенная для отслеживания состояния и управления высокодоступными кластерами **PostgreSQL** под управлением **Patroni**.
 
 Проект разработан с использованием библиотек [Charm](https://charm.sh/) (`bubbletea`, `lipgloss`, `bubbles`), обеспечивающих удобный графический интерфейс прямо в терминале с поддержкой горячих клавиш.
 
@@ -118,8 +118,8 @@ Distributed under the **MIT License**.
 
 ```bash
 # Клонирование репозитория
-git clone https://github.com/your-username/cluster-tui.git
-cd cluster-tui
+git clone https://github.com/your-username/wunschpunsch.git
+cd wunschpunsch
 
 # Установка зависимостей
 go mod download
@@ -128,8 +128,8 @@ go mod download
 go run main.go
 
 # Сборка бинарного файла
-go build -o cluster-tui main.go
-./cluster-tui
+go build -o wunschpunsch main.go
+./wunschpunsch
 ```
 
 ### Горячие клавиши
