@@ -1,12 +1,9 @@
 name: CI/CD Pipeline
-
 on:
   push:
     branches: [ "main" ]
     tags:
       - 'v*'
-      - 'Release_*'
-      - 'release-*'
   pull_request:
     branches: [ "main" ]
 
