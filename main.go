@@ -3,7 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -65,6 +68,12 @@ var (
 			Foreground(lipgloss.Color("#11111B")).
 			Background(primaryColor).
 			Padding(0, 1)
+
+	badgeStandalone = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("#11111B")).
+			Background(warningColor).
+			Padding(0, 1)
 )
 
 type activeTab int
@@ -77,23 +86,48 @@ const (
 	tabLogs
 )
 
+type engineType int
+
+const (
+	EngineAutoDetect engineType = iota
+	EnginePatroni
+	EnginePacemaker
+	EngineSingleNode
+)
+
+func (e engineType) String() string {
+	switch e {
+	case EnginePatroni:
+		return "Patroni (etcd)"
+	case EnginePacemaker:
+		return "Corosync + Pacemaker"
+	case EngineSingleNode:
+		return "Single Node (Standalone PG)"
+	default:
+		return "Auto-Detecting..."
+	}
+}
+
 // --- Custom Messages ---
 type tickMsg time.Time
 type clusterUpdateMsg struct {
-	status  *patroni.ClusterStatus
-	metrics map[string]postgres.NodeMetrics
-	err     error
+	detectedEngine engineType
+	status         *patroni.ClusterStatus
+	metrics        map[string]postgres.NodeMetrics
+	err            error
 }
 
 type model struct {
-	tab           activeTab
-	table         table.Model
-	clusterEngine string
-	pgFlavor      string
-	width         int
-	height        int
+	tab            activeTab
+	table          table.Model
+	detectedEngine engineType
+	pgFlavor       string
+	targetHost     string
+	targetPort     int
+	width          int
+	height         int
 
-	// Login Form Inputs
+	// Form Inputs
 	inputs     []textinput.Model
 	focusIndex int
 	connecting bool
@@ -108,31 +142,29 @@ type model struct {
 }
 
 func initialModel() model {
-	// Инициализация полей ввода
 	inputs := make([]textinput.Model, 3)
 
 	inputs[0] = textinput.New()
-	inputs[0].Placeholder = "http://127.0.0.1:8001 (или http://192.168.1.10:8008)"
+	inputs[0].Placeholder = "localhost:5432 или http://127.0.0.1:8008"
 	inputs[0].Focus()
 	inputs[0].CharLimit = 128
-	inputs[0].Width = 55
-	inputs[0].Prompt = "Patroni URL: "
+	inputs[0].Width = 60
+	inputs[0].Prompt = "Endpoint / Host: "
 
 	inputs[1] = textinput.New()
 	inputs[1].Placeholder = "postgres"
 	inputs[1].CharLimit = 64
-	inputs[1].Width = 55
-	inputs[1].Prompt = "PG User:     "
+	inputs[1].Width = 60
+	inputs[1].Prompt = "PG User:         "
 
 	inputs[2] = textinput.New()
 	inputs[2].Placeholder = "password"
 	inputs[2].EchoMode = textinput.EchoPassword
 	inputs[2].EchoCharacter = '•'
 	inputs[2].CharLimit = 64
-	inputs[2].Width = 55
-	inputs[2].Prompt = "PG Password: "
+	inputs[2].Width = 60
+	inputs[2].Prompt = "PG Password:     "
 
-	// Колонки таблицы
 	columns := []table.Column{
 		{Title: "Node Name", Width: 16},
 		{Title: "Host", Width: 14},
@@ -164,30 +196,87 @@ func initialModel() model {
 	t.SetStyles(s)
 
 	return model{
-		tab:           tabConnect,
-		table:         t,
-		inputs:        inputs,
-		focusIndex:    0,
-		clusterEngine: "Patroni ( etcd )",
-		pgFlavor:      "PostgreSQL / Postgres Pro",
-		lastMetrics:   make(map[string]postgres.NodeMetrics),
+		tab:            tabConnect,
+		table:          t,
+		inputs:         inputs,
+		focusIndex:     0,
+		detectedEngine: EngineAutoDetect,
+		pgFlavor:       "PostgreSQL / Postgres Pro",
+		lastMetrics:    make(map[string]postgres.NodeMetrics),
 	}
+}
+
+// Извлечение чистого хоста и порта из ввода
+func parseHostAndPort(rawInput string) (string, int) {
+	cleaned := strings.TrimPrefix(rawInput, "http://")
+	cleaned = strings.TrimPrefix(cleaned, "https://")
+	if idx := strings.Index(cleaned, "/"); idx != -1 {
+		cleaned = cleaned[:idx]
+	}
+
+	host, portStr, err := net.SplitHostPort(cleaned)
+	if err != nil {
+		host = cleaned
+		portStr = "5432"
+	}
+
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		port = 5432
+	}
+
+	if host == "" {
+		host = "127.0.0.1"
+	}
+
+	return host, port
 }
 
 func (m model) fetchClusterDataCmd() tea.Cmd {
 	return func() tea.Msg {
-		if m.patroniClient == nil || m.pgManager == nil {
+		if m.pgManager == nil {
 			return nil
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 
-		status, err := m.patroniClient.GetClusterState(ctx)
-		if err != nil {
-			return clusterUpdateMsg{err: err}
+		var status *patroni.ClusterStatus
+		detected := EnginePatroni
+
+		// 1. Пробуем подключиться через Patroni REST API
+		if m.patroniClient != nil {
+			st, err := m.patroniClient.GetClusterState(ctx)
+			if err == nil {
+				status = st
+			}
 		}
 
+		// 2. Если Patroni недоступен, проверяем прямое подключение к PostgreSQL (Single Node)
+		if status == nil {
+			metrics := m.pgManager.FetchNodeMetrics(ctx, m.targetHost)
+			if metrics.Error == nil {
+				detected = EngineSingleNode
+				status = &patroni.ClusterStatus{
+					Members: []patroni.Member{
+						{
+							Name:     m.targetHost,
+							Host:     m.targetHost,
+							Role:     "standalone",
+							State:    "running",
+							Timeline: 1,
+							Lag:      0,
+						},
+					},
+				}
+			} else {
+				return clusterUpdateMsg{
+					err: fmt.Errorf("unable to connect to PG at %s:%d: %v", m.targetHost, m.targetPort, metrics.Error),
+				}
+			}
+		}
+
+		// 3. Сбор метрик
 		metricsMap := make(map[string]postgres.NodeMetrics)
 		var wg sync.WaitGroup
 		var mu sync.Mutex
@@ -207,8 +296,9 @@ func (m model) fetchClusterDataCmd() tea.Cmd {
 		wg.Wait()
 
 		return clusterUpdateMsg{
-			status:  status,
-			metrics: metricsMap,
+			detectedEngine: detected,
+			status:         status,
+			metrics:        metricsMap,
 		}
 	}
 }
@@ -245,9 +335,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		// Успешное подключение
 		m.lastError = nil
 		m.connected = true
+		m.detectedEngine = msg.detectedEngine
 		m.lastStatus = msg.status
 		m.lastMetrics = msg.metrics
 
@@ -298,7 +388,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		// Логика переключения закладок (работает только если подлючены)
 		if m.connected {
 			switch msg.String() {
 			case "tab", "l", "right":
@@ -320,7 +409,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		// Логика навигации по форме ввода
 		if m.tab == tabConnect {
 			switch msg.String() {
 			case "up":
@@ -330,7 +418,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, m.updateFocus()
 
-			case "down", "tab":
+			case "down":
 				m.focusIndex++
 				if m.focusIndex >= len(m.inputs) {
 					m.focusIndex = 0
@@ -338,11 +426,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.updateFocus()
 
 			case "enter":
-				// Нажатие Enter инициализирует подключение
-				patroniURL := m.inputs[0].Value()
-				if patroniURL == "" {
-					patroniURL = m.inputs[0].Placeholder
+				rawEndpoint := m.inputs[0].Value()
+				if rawEndpoint == "" {
+					rawEndpoint = m.inputs[0].Placeholder
 				}
+
+				host, port := parseHostAndPort(rawEndpoint)
+				m.targetHost = host
+				m.targetPort = port
 
 				pgUser := m.inputs[1].Value()
 				if pgUser == "" {
@@ -354,12 +445,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					pgPass = m.inputs[2].Placeholder
 				}
 
-				m.patroniClient = patroni.NewClient([]string{patroniURL}, 2*time.Second)
+				httpEndpoint := rawEndpoint
+				if !strings.HasPrefix(httpEndpoint, "http://") && !strings.HasPrefix(httpEndpoint, "https://") {
+					httpEndpoint = "http://" + httpEndpoint
+				}
+
+				m.patroniClient = patroni.NewClient([]string{httpEndpoint}, 1500*time.Millisecond)
 				m.pgManager = postgres.NewPGPoolManager(postgres.Config{
 					User:     pgUser,
 					Password: pgPass,
 					Database: "postgres",
-					Port:     5432,
+					Port:     port,
 				})
 
 				m.connecting = true
@@ -367,7 +463,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Batch(m.fetchClusterDataCmd(), tickCmd())
 			}
 
-			// Обновляем ввод в активном текстовом поле
 			cmd := m.updateInputs(msg)
 			return m, cmd
 		}
@@ -407,9 +502,13 @@ func (m model) View() string {
 		return "Initializing TUI..."
 	}
 
-	// 1. Header & Tabs
+	containerWidth := m.width - 4
+	if containerWidth < 40 {
+		containerWidth = 40
+	}
+
 	header := headerStyle.Render(" PG-CLUSTER TUI ") + "  " +
-		lipgloss.NewStyle().Foreground(primaryColor).Bold(true).Render("Engine: "+m.clusterEngine) +
+		lipgloss.NewStyle().Foreground(primaryColor).Bold(true).Render("Engine: "+m.detectedEngine.String()) +
 		statusLineStyle.Render(" | Target: "+m.pgFlavor)
 
 	tabs := []string{"0: Connect", "1: Topology", "2: Metrics", "3: Actions", "4: Event Logs"}
@@ -421,23 +520,28 @@ func (m model) View() string {
 			renderedTabs = append(renderedTabs, inactiveTabStyle.Render(t))
 		}
 	}
-	tabRow := tabBorderStyle.Render(lipgloss.JoinHorizontal(lipgloss.Top, renderedTabs...))
 
-	// 2. Main Content Body
+	tabRow := tabBorderStyle.Width(containerWidth + 2).Render(lipgloss.JoinHorizontal(lipgloss.Top, renderedTabs...))
+	currentBoxStyle := boxStyle.Width(containerWidth)
+
 	var body string
 
 	if m.tab == tabConnect {
 		var statusMsg string
 		if m.connecting {
-			statusMsg = lipgloss.NewStyle().Foreground(warningColor).Render("Connecting to cluster...")
+			statusMsg = lipgloss.NewStyle().Foreground(warningColor).Render("Detecting HA Engine / Standalone PG & Connecting...")
 		} else if m.lastError != nil {
-			statusMsg = lipgloss.NewStyle().Foreground(dangerColor).Render(fmt.Sprintf("Connection Error: %v", m.lastError))
+			errText := fmt.Sprintf("Connection Error: %v", m.lastError)
+			statusMsg = lipgloss.NewStyle().
+				Foreground(dangerColor).
+				Width(containerWidth - 4).
+				Render(errText)
 		}
 
 		form := lipgloss.JoinVertical(
 			lipgloss.Left,
-			lipgloss.NewStyle().Bold(true).Foreground(secondaryColor).Render("Connect to PostgreSQL / Patroni Cluster"),
-			"\n",
+			lipgloss.NewStyle().Bold(true).Foreground(secondaryColor).Render("Connect to PostgreSQL Cluster or Single Database"),
+			"\n\n",
 			m.inputs[0].View(),
 			"\n",
 			m.inputs[1].View(),
@@ -446,42 +550,45 @@ func (m model) View() string {
 			"\n",
 			statusMsg,
 			"\n\n",
-			lipgloss.NewStyle().Foreground(subtleColor).Render("Press [ENTER] to Connect  •  [TAB/Arrows] Move Focus"),
+			lipgloss.NewStyle().Foreground(subtleColor).Render("Press [ENTER] to Connect  •  [Up/Down] Move Focus"),
 		)
-		body = boxStyle.Render(form)
+		body = currentBoxStyle.Render(form)
 	} else {
 		switch m.tab {
 		case tabTopology:
-			primaryNode := "Unknown"
-			totalNodes := 0
-			isPause := false
+			summary := badgeStandalone.Render("SINGLE NODE / STANDALONE MODE")
+			if m.detectedEngine != EngineSingleNode {
+				primaryNode := "Unknown"
+				totalNodes := 0
+				isPause := false
 
-			if m.lastStatus != nil {
-				totalNodes = len(m.lastStatus.Members)
-				isPause = m.lastStatus.Pause
-				for _, mem := range m.lastStatus.Members {
-					if mem.Role == "leader" {
-						primaryNode = mem.Name
-						break
+				if m.lastStatus != nil {
+					totalNodes = len(m.lastStatus.Members)
+					isPause = m.lastStatus.Pause
+					for _, mem := range m.lastStatus.Members {
+						if mem.Role == "leader" {
+							primaryNode = mem.Name
+							break
+						}
 					}
 				}
+
+				maintStr := lipgloss.NewStyle().Foreground(successColor).Render("Maintenance: OFF")
+				if isPause {
+					maintStr = lipgloss.NewStyle().Foreground(warningColor).Render("Maintenance: ON (Paused)")
+				}
+
+				summary = lipgloss.JoinHorizontal(
+					lipgloss.Left,
+					badgePrimary.Render("PRIMARY: "+primaryNode),
+					"  ",
+					badgeReplica.Render(fmt.Sprintf("NODES: %d", totalNodes)),
+					"  ",
+					maintStr,
+				)
 			}
 
-			maintStr := lipgloss.NewStyle().Foreground(successColor).Render("Maintenance: OFF")
-			if isPause {
-				maintStr = lipgloss.NewStyle().Foreground(warningColor).Render("Maintenance: ON (Paused)")
-			}
-
-			summary := lipgloss.JoinHorizontal(
-				lipgloss.Left,
-				badgePrimary.Render("PRIMARY: "+primaryNode),
-				"  ",
-				badgeReplica.Render(fmt.Sprintf("NODES: %d", totalNodes)),
-				"  ",
-				maintStr,
-			)
-
-			body = boxStyle.Render(
+			body = currentBoxStyle.Render(
 				lipgloss.JoinVertical(
 					lipgloss.Left,
 					summary,
@@ -505,7 +612,7 @@ func (m model) View() string {
 				}
 			}
 
-			body = boxStyle.Render(
+			body = currentBoxStyle.Render(
 				lipgloss.JoinVertical(
 					lipgloss.Left,
 					lipgloss.NewStyle().Bold(true).Foreground(secondaryColor).Render("PostgreSQL Performance Metrics"),
@@ -515,28 +622,40 @@ func (m model) View() string {
 			)
 
 		case tabActions:
-			body = boxStyle.Render(
-				lipgloss.JoinVertical(
-					lipgloss.Left,
-					lipgloss.NewStyle().Bold(true).Foreground(dangerColor).Render("Cluster Management Actions"),
-					"\n",
-					"[S] Switchover (Graceful Leader Transfer)",
-					"[F] Failover (Force Leader Selection)",
-					"[R] Reinitialize Replica",
-					"[P] Pause/Resume Auto-failover (Maintenance Mode)",
-				),
-			)
+			if m.detectedEngine == EngineSingleNode {
+				body = currentBoxStyle.Render(
+					lipgloss.JoinVertical(
+						lipgloss.Left,
+						lipgloss.NewStyle().Bold(true).Foreground(warningColor).Render("Cluster Management Actions Disabled"),
+						"\n",
+						lipgloss.NewStyle().Foreground(subtleColor).Render(
+							"HA operations (Switchover, Failover, Reinitialization) are unavailable for Single-Node / Standalone PostgreSQL instances.",
+						),
+					),
+				)
+			} else {
+				body = currentBoxStyle.Render(
+					lipgloss.JoinVertical(
+						lipgloss.Left,
+						lipgloss.NewStyle().Bold(true).Foreground(dangerColor).Render("Cluster Management Actions"),
+						"\n",
+						"[S] Switchover (Graceful Leader Transfer)",
+						"[F] Failover (Force Leader Selection)",
+						"[R] Reinitialize Replica",
+						"[P] Pause/Resume Auto-failover (Maintenance Mode)",
+					),
+				)
+			}
 
 		case tabLogs:
-			body = boxStyle.Render(
+			body = currentBoxStyle.Render(
 				lipgloss.NewStyle().Foreground(subtleColor).Render(
-					"Real-time Patroni events log viewer will appear here...",
+					"Real-time events log viewer...",
 				),
 			)
 		}
 	}
 
-	// 3. Footer / Help Bar
 	footer := statusLineStyle.Render("Tab/Arrow: Move / Switch Tab  •  Ctrl+C: Quit")
 
 	return lipgloss.JoinVertical(
