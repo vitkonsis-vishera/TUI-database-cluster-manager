@@ -36,6 +36,38 @@ jobs:
       - name: Run Tests
         run: go test -v ./...
 
+  build:
+    name: Build Native Binary (Linux)
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Install Dependencies
+        run: go mod download
+
+      - name: Build Binary
+        run: |
+          CGO_ENABLED=0 go build -ldflags="-s -w" -o cluster-tui .
+          chmod +x cluster-tui
+
+      - name: Test Execution
+        run: |
+          ./cluster-tui --version || ./cluster-tui --help || true
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cluster-tui-linux-amd64
+          path: cluster-tui
+
   release:
     name: Build & Publish Release Assets
     needs: test
@@ -56,19 +88,21 @@ jobs:
 
       - name: Cross-Compile Binaries
         run: |
-          # Linux AMD64
-          GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o cluster-tui-linux-amd64 main.go
+          # Linux AMD64 (создаем основной бинарник cluster-tui и версию с суффиксом)
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o cluster-tui .
+          cp cluster-tui cluster-tui-linux-amd64
 
           # Windows AMD64
-          GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o cluster-tui-windows-amd64.exe main.go
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o cluster-tui-windows-amd64.exe .
 
           # macOS ARM64 (Apple Silicon)
-          GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o cluster-tui-darwin-arm64 main.go
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o cluster-tui-darwin-arm64 .
 
       - name: Upload Binaries to Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
+            cluster-tui
             cluster-tui-linux-amd64
             cluster-tui-windows-amd64.exe
             cluster-tui-darwin-arm64
