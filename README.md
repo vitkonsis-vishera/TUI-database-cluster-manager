@@ -1,4 +1,5 @@
 # 🐘 Wunschpunsch: Database cluster TUI
+<img width="1024" height="559" alt="image" src="https://github.com/user-attachments/assets/535a4bae-0064-4a7a-8d1d-92f547d62edd" />
 
 [English](#english) | [Русский](#русский)
 
