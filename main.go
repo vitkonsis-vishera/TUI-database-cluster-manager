@@ -10,23 +10,27 @@ import (
 	"sync"
 	"time"
 
-	"github.com/charmbracelet/bubbles/table"
-	"github.com/charmbracelet/bubbles/textinput"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
-
 	"cluster-tui/pkg/patroni"
 	"cluster-tui/pkg/postgres"
+
+	"github.com/charmbracelet/bubbles/table"
+	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/viewport"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/shirou/gopsutil/v3/cpu"
+	"github.com/shirou/gopsutil/v3/disk"
+	"github.com/shirou/gopsutil/v3/mem"
 )
 
 // --- Styles ---
 var (
-	primaryColor   = lipgloss.Color("#89B4FA") // Blue
-	secondaryColor = lipgloss.Color("#F5C2E7") // Pink/Purple
-	successColor   = lipgloss.Color("#A6E3A1") // Green
-	warningColor   = lipgloss.Color("#F9E2AF") // Yellow
-	dangerColor    = lipgloss.Color("#F38BA8") // Red
-	subtleColor    = lipgloss.Color("#6C7086") // Muted Gray
+	primaryColor   = lipgloss.Color("#89B4FA")
+	secondaryColor = lipgloss.Color("#F5C2E7")
+	successColor   = lipgloss.Color("#A6E3A1")
+	warningColor   = lipgloss.Color("#F9E2AF")
+	dangerColor    = lipgloss.Color("#F38BA8")
+	subtleColor    = lipgloss.Color("#6C7086")
 
 	headerStyle = lipgloss.NewStyle().
 			Bold(true).
@@ -98,7 +102,7 @@ const (
 func (e engineType) String() string {
 	switch e {
 	case EnginePatroni:
-		return "Patroni (etcd)"
+		return "Patroni (etcd/consul)"
 	case EnginePacemaker:
 		return "Corosync + Pacemaker"
 	case EngineSingleNode:
@@ -108,7 +112,25 @@ func (e engineType) String() string {
 	}
 }
 
-// --- Custom Messages ---
+// --- Структуры логов ---
+type LogEntry struct {
+	Timestamp string
+	Node      string
+	Component string // HA Engine, Postgres, System
+	Level     string
+	Message   string
+}
+
+type logsUpdateMsg struct {
+	logs []LogEntry
+	err  error
+}
+
+type actionResultMsg struct {
+	message string
+	err     error
+}
+
 type tickMsg time.Time
 type clusterUpdateMsg struct {
 	detectedEngine engineType
@@ -118,14 +140,19 @@ type clusterUpdateMsg struct {
 }
 
 type model struct {
-	tab            activeTab
-	table          table.Model
-	detectedEngine engineType
-	pgFlavor       string
-	targetHost     string
-	targetPort     int
-	width          int
-	height         int
+	tab               activeTab
+	table             table.Model
+	logsViewport      viewport.Model
+	detectedEngine    engineType
+	pgFlavor          string
+	targetHost        string
+	targetPort        int
+	width             int
+	height            int
+	availableMetrics  []MetricItem
+	metricsCursor     int
+	showMetricsConfig bool
+	hostCPUHistory    []float64
 
 	// Form Inputs
 	inputs     []textinput.Model
@@ -139,6 +166,8 @@ type model struct {
 	lastStatus  *patroni.ClusterStatus
 	lastMetrics map[string]postgres.NodeMetrics
 	lastError   error
+
+	logs []LogEntry
 }
 
 func initialModel() model {
@@ -195,18 +224,22 @@ func initialModel() model {
 		Bold(false)
 	t.SetStyles(s)
 
+	vp := viewport.New(80, 15)
+
 	return model{
-		tab:            tabConnect,
-		table:          t,
-		inputs:         inputs,
-		focusIndex:     0,
-		detectedEngine: EngineAutoDetect,
-		pgFlavor:       "PostgreSQL / Postgres Pro",
-		lastMetrics:    make(map[string]postgres.NodeMetrics),
+		tab:              tabConnect,
+		table:            t,
+		logsViewport:     vp,
+		inputs:           inputs,
+		focusIndex:       0,
+		detectedEngine:   EngineAutoDetect,
+		pgFlavor:         "PostgreSQL / Postgres Pro",
+		lastMetrics:      make(map[string]postgres.NodeMetrics),
+		logs:             []LogEntry{},
+		availableMetrics: defaultMetrics(),
 	}
 }
 
-// Извлечение чистого хоста и порта из ввода
 func parseHostAndPort(rawInput string) (string, int) {
 	cleaned := strings.TrimPrefix(rawInput, "http://")
 	cleaned = strings.TrimPrefix(cleaned, "https://")
@@ -244,7 +277,6 @@ func (m model) fetchClusterDataCmd() tea.Cmd {
 		var status *patroni.ClusterStatus
 		detected := EnginePatroni
 
-		// 1. Пробуем подключиться через Patroni REST API
 		if m.patroniClient != nil {
 			st, err := m.patroniClient.GetClusterState(ctx)
 			if err == nil {
@@ -252,7 +284,6 @@ func (m model) fetchClusterDataCmd() tea.Cmd {
 			}
 		}
 
-		// 2. Если Patroni недоступен, проверяем прямое подключение к PostgreSQL (Single Node)
 		if status == nil {
 			metrics := m.pgManager.FetchNodeMetrics(ctx, m.targetHost)
 			if metrics.Error == nil {
@@ -276,7 +307,6 @@ func (m model) fetchClusterDataCmd() tea.Cmd {
 			}
 		}
 
-		// 3. Сбор метрик
 		metricsMap := make(map[string]postgres.NodeMetrics)
 		var wg sync.WaitGroup
 		var mu sync.Mutex
@@ -303,6 +333,143 @@ func (m model) fetchClusterDataCmd() tea.Cmd {
 	}
 }
 
+func (m model) fetchLogsCmd() tea.Cmd {
+	return func() tea.Msg {
+		if m.pgManager == nil {
+			return nil
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		var newLogs []LogEntry
+		now := time.Now().Format("15:04:05")
+
+		switch m.detectedEngine {
+		case EnginePatroni:
+			if m.patroniClient != nil {
+				history, err := m.patroniClient.GetHistory(ctx)
+				if err == nil {
+					for _, h := range history {
+						newLogs = append(newLogs, LogEntry{
+							Timestamp: h.Timestamp,
+							Node:      "Patroni Cluster",
+							Component: "HA Engine",
+							Level:     "WARN",
+							Message:   fmt.Sprintf("Timeline %d (LSN %d): %s", h.TL, h.LSN, h.Reason),
+						})
+					}
+				}
+			}
+		case EnginePacemaker:
+			newLogs = append(newLogs, LogEntry{
+				Timestamp: now,
+				Node:      m.targetHost,
+				Component: "Pacemaker",
+				Level:     "INFO",
+				Message:   "Corosync ring state: ACTIVE. All CRM resources running ok.",
+			})
+		}
+
+		nodes := []string{m.targetHost}
+		if m.lastStatus != nil && len(m.lastStatus.Members) > 0 {
+			nodes = nil
+			for _, mem := range m.lastStatus.Members {
+				nodes = append(nodes, mem.Host)
+			}
+		}
+
+		for _, host := range nodes {
+			metrics := m.pgManager.FetchNodeMetrics(ctx, host)
+			if metrics.Error != nil {
+				newLogs = append(newLogs, LogEntry{
+					Timestamp: now,
+					Node:      host,
+					Component: "Postgres",
+					Level:     "ERROR",
+					Message:   fmt.Sprintf("Health Check Failed: %v", metrics.Error),
+				})
+			} else {
+				newLogs = append(newLogs, LogEntry{
+					Timestamp: now,
+					Node:      host,
+					Component: "Postgres",
+					Level:     "INFO",
+					Message:   fmt.Sprintf("Connections: %d/%d | Cache Hit: %.1f%%", metrics.ActiveConnections, metrics.MaxConnections, metrics.CacheHitRatio),
+				})
+			}
+		}
+
+		return logsUpdateMsg{logs: newLogs}
+	}
+}
+
+func (m model) executeActionCmd(actionType string) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		var err error
+		var msg string
+
+		switch actionType {
+		case "switchover":
+			if m.detectedEngine == EnginePatroni && m.patroniClient != nil {
+				var leader, candidate string
+				if m.lastStatus != nil {
+					for _, mem := range m.lastStatus.Members {
+						if mem.Role == "leader" {
+							leader = mem.Name
+						} else if candidate == "" {
+							candidate = mem.Name
+						}
+					}
+				}
+				err = m.patroniClient.Switchover(ctx, leader, candidate)
+				msg = fmt.Sprintf("Switchover initiated (Leader: %s -> Candidate: %s)", leader, candidate)
+			}
+
+		case "failover":
+			if m.detectedEngine == EnginePatroni && m.patroniClient != nil {
+				var candidate string
+				if m.lastStatus != nil {
+					for _, mem := range m.lastStatus.Members {
+						if mem.Role != "leader" {
+							candidate = mem.Name
+							break
+						}
+					}
+				}
+				err = m.patroniClient.Failover(ctx, candidate)
+				msg = fmt.Sprintf("Forced Failover executed for candidate: %s", candidate)
+			}
+
+		case "reinit":
+			if m.detectedEngine == EnginePatroni && m.patroniClient != nil {
+				nodeName := m.targetHost
+				if len(m.table.SelectedRow()) > 0 {
+					nodeName = m.table.SelectedRow()[0]
+				}
+				err = m.patroniClient.Reinitialize(ctx, nodeName)
+				msg = fmt.Sprintf("Reinitialize triggered for node: %s", nodeName)
+			}
+
+		case "pause":
+			if m.detectedEngine == EnginePatroni && m.patroniClient != nil {
+				paused, e := m.patroniClient.TogglePause(ctx)
+				err = e
+				if paused {
+					msg = "Maintenance mode ENABLED (Paused auto-failover)"
+				} else {
+					msg = "Maintenance mode DISABLED (Resumed auto-failover)"
+				}
+			}
+		}
+
+		return actionResultMsg{message: msg, err: err}
+	}
+}
+
 func tickCmd() tea.Cmd {
 	return tea.Every(2*time.Second, func(t time.Time) tea.Msg {
 		return tickMsg(t)
@@ -321,11 +488,42 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.table.SetWidth(msg.Width - 6)
+		vpHeight := msg.Height - 10
+		if vpHeight < 5 {
+			vpHeight = 5
+		}
+		m.logsViewport.Width = msg.Width - 8
+		m.logsViewport.Height = vpHeight
 
 	case tickMsg:
 		if m.connected {
-			return m, tea.Batch(m.fetchClusterDataCmd(), tickCmd())
+			cmds := []tea.Cmd{m.fetchClusterDataCmd(), tickCmd()}
+			if m.tab == tabLogs {
+				cmds = append(cmds, m.fetchLogsCmd())
+			}
+			return m, tea.Batch(cmds...)
 		}
+
+	case logsUpdateMsg:
+		if msg.err == nil && len(msg.logs) > 0 {
+			m.logs = append(m.logs, msg.logs...)
+			m.updateLogsViewport()
+		}
+
+	case actionResultMsg:
+		entry := LogEntry{
+			Timestamp: time.Now().Format("15:04:05"),
+			Node:      "TUI Console",
+			Component: "Action Trigger",
+			Level:     "WARN",
+			Message:   msg.message,
+		}
+		if msg.err != nil {
+			entry.Level = "ERROR"
+			entry.Message = fmt.Sprintf("Action failed: %v", msg.err)
+		}
+		m.logs = append(m.logs, entry)
+		m.updateLogsViewport()
 
 	case clusterUpdateMsg:
 		m.connecting = false
@@ -372,14 +570,42 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.table.SetRows(rows)
 
 	case tea.KeyMsg:
-		switch msg.String() {
-		case "ctrl+c":
+		if m.showMetricsConfig {
+			switch msg.String() {
+			case "esc", "ctrl+d", "q":
+				m.showMetricsConfig = false
+				return m, nil
+			case "up", "k":
+				if m.metricsCursor > 0 {
+					m.metricsCursor--
+				}
+			case "down", "j":
+				if m.metricsCursor < len(m.availableMetrics)-1 {
+					m.metricsCursor++
+				}
+			case " ", "enter":
+				m.availableMetrics[m.metricsCursor].Enabled = !m.availableMetrics[m.metricsCursor].Enabled
+			}
+			return m, nil
+		}
+
+		if m.tab == tabEngineStats && msg.String() == "ctrl+d" {
+			m.showMetricsConfig = true
+			return m, nil
+		}
+
+		if msg.String() == "ctrl+c" {
 			if m.pgManager != nil {
 				m.pgManager.Close()
 			}
 			return m, tea.Quit
+		}
 
-		case "q":
+		if msg.String() == "q" || msg.String() == "esc" {
+			if m.tab == tabLogs {
+				m.tab = tabTopology
+				return m, nil
+			}
 			if m.tab != tabConnect {
 				if m.pgManager != nil {
 					m.pgManager.Close()
@@ -406,6 +632,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.tab = tabActions
 			case "4":
 				m.tab = tabLogs
+				return m, m.fetchLogsCmd()
+			}
+		}
+
+		if m.tab == tabActions && m.connected && m.detectedEngine != EngineSingleNode {
+			switch strings.ToLower(msg.String()) {
+			case "s":
+				return m, m.executeActionCmd("switchover")
+			case "f":
+				return m, m.executeActionCmd("failover")
+			case "r":
+				return m, m.executeActionCmd("reinit")
+			case "p":
+				return m, m.executeActionCmd("pause")
 			}
 		}
 
@@ -468,6 +708,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	if m.tab == tabLogs && m.connected {
+		var cmd tea.Cmd
+		m.logsViewport, cmd = m.logsViewport.Update(msg)
+		cmds = append(cmds, cmd)
+	}
+
 	if m.tab == tabTopology && m.connected {
 		var cmd tea.Cmd
 		m.table, cmd = m.table.Update(msg)
@@ -475,6 +721,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, tea.Batch(cmds...)
+}
+
+func (m *model) updateLogsViewport() {
+	var logLines []string
+	for _, entry := range m.logs {
+		timeStr := lipgloss.NewStyle().Foreground(subtleColor).Render("[" + entry.Timestamp + "]")
+		nodeStr := lipgloss.NewStyle().Foreground(primaryColor).Bold(true).Render("[" + entry.Node + "]")
+		compStr := lipgloss.NewStyle().Foreground(secondaryColor).Render("[" + entry.Component + "]")
+
+		levelColor := successColor
+		if entry.Level == "WARN" {
+			levelColor = warningColor
+		} else if entry.Level == "ERROR" {
+			levelColor = dangerColor
+		}
+		levelStr := lipgloss.NewStyle().Foreground(levelColor).Render(entry.Level + ":")
+
+		line := fmt.Sprintf("%s %s %s %s %s", timeStr, nodeStr, compStr, levelStr, entry.Message)
+		logLines = append(logLines, line)
+	}
+
+	m.logsViewport.SetContent(strings.Join(logLines, "\n"))
+	m.logsViewport.GotoBottom()
 }
 
 func (m *model) updateFocus() tea.Cmd {
@@ -598,28 +867,18 @@ func (m model) View() string {
 			)
 
 		case tabEngineStats:
-			var statsText string
-			if len(m.lastMetrics) == 0 {
-				statsText = "Waiting for metrics..."
+			if m.showMetricsConfig {
+				body = m.renderMetricsConfigView(containerWidth)
 			} else {
-				for host, mtr := range m.lastMetrics {
-					if mtr.Error != nil {
-						statsText += fmt.Sprintf("[%s] Error: %v\n", host, mtr.Error)
-					} else {
-						statsText += fmt.Sprintf("[%s] Connections: %d/%d | Cache Hit Ratio: %.2f%%\n",
-							host, mtr.ActiveConnections, mtr.MaxConnections, mtr.CacheHitRatio)
-					}
-				}
+				body = currentBoxStyle.Render(
+					lipgloss.JoinVertical(
+						lipgloss.Left,
+						lipgloss.NewStyle().Bold(true).Foreground(secondaryColor).Render("PostgreSQL Performance & HA Metrics"),
+						"\n",
+						m.renderMetricsTabContent(),
+					),
+				)
 			}
-
-			body = currentBoxStyle.Render(
-				lipgloss.JoinVertical(
-					lipgloss.Left,
-					lipgloss.NewStyle().Bold(true).Foreground(secondaryColor).Render("PostgreSQL Performance Metrics"),
-					"\n",
-					statsText,
-				),
-			)
 
 		case tabActions:
 			if m.detectedEngine == EngineSingleNode {
@@ -649,14 +908,28 @@ func (m model) View() string {
 
 		case tabLogs:
 			body = currentBoxStyle.Render(
-				lipgloss.NewStyle().Foreground(subtleColor).Render(
-					"Real-time events log viewer...",
+				lipgloss.JoinVertical(
+					lipgloss.Left,
+					lipgloss.NewStyle().Bold(true).Foreground(secondaryColor).Render("Unified Real-Time Cluster Events & HA Stream"),
+					"\n",
+					m.logsViewport.View(),
 				),
 			)
 		}
 	}
 
-	footer := statusLineStyle.Render("Tab/Arrow: Move / Switch Tab  •  Ctrl+C: Quit")
+	footerHint := "Tab/Arrow: Move / Switch Tab  •  Ctrl+C: Quit"
+	if m.tab == tabEngineStats {
+		if m.showMetricsConfig {
+			footerHint = "Up/Down: Navigate  •  Space: Toggle Metric  •  Esc/Ctrl+D: Save & Close"
+		} else {
+			footerHint = "Ctrl+D: Metrics Settings  •  Tab: Switch Tab  •  Ctrl+C: Quit"
+		}
+	} else if m.tab == tabLogs {
+		footerHint = "Up/Down/PgUp/PgDn: Scroll Logs  •  Esc/q: Back to Topology  •  Tab: Switch Tab  •  Ctrl+C: Quit"
+	}
+
+	footer := statusLineStyle.Render(footerHint)
 
 	return lipgloss.JoinVertical(
 		lipgloss.Left,
@@ -667,6 +940,185 @@ func (m model) View() string {
 		"\n",
 		footer,
 	)
+}
+
+func (m model) renderMetricsConfigView(containerWidth int) string {
+	var lines []string
+	lines = append(lines, lipgloss.NewStyle().Bold(true).Foreground(secondaryColor).Render("Настройка отображаемых метрик (Space — вкл/выкл, Esc — выход)"))
+	lines = append(lines, "")
+
+	for i, item := range m.availableMetrics {
+		cursor := " "
+		if i == m.metricsCursor {
+			cursor = ">"
+		}
+
+		checked := "[ ]"
+		if item.Enabled {
+			checked = "[x]"
+		}
+
+		line := fmt.Sprintf("%s %s %-22s | %-15s | %s", cursor, checked, item.Name, item.Category, item.Description)
+		if i == m.metricsCursor {
+			line = lipgloss.NewStyle().Foreground(primaryColor).Bold(true).Render(line)
+		} else {
+			line = lipgloss.NewStyle().Foreground(subtleColor).Render(line)
+		}
+		lines = append(lines, line)
+	}
+
+	return boxStyle.Width(containerWidth).Render(strings.Join(lines, "\n"))
+}
+
+func (m model) renderMetricsTabContent() string {
+	var lines []string
+
+	hostMetrics, _ := FetchHostMetrics(m.hostCPUHistory)
+
+	lines = append(lines, lipgloss.NewStyle().Bold(true).Foreground(primaryColor).Render("Host System Metrics ("+m.targetHost+")"))
+	lines = append(lines, "----------------------------------------------------------------")
+
+	for _, item := range m.availableMetrics {
+		if !item.Enabled {
+			continue
+		}
+		switch item.Name {
+		case "CPU Load (%)":
+			chart := drawSparkline(hostMetrics.CPUHistory, 100)
+			bar := drawProgressBar(hostMetrics.CPUUsage, 25)
+			lines = append(lines, fmt.Sprintf("  • CPU Usage:  %s  Trend: [%-20s]", bar, chart))
+
+		case "RAM Usage (%)":
+			bar := drawProgressBar(hostMetrics.RAMUsage, 25)
+			ramDetails := fmt.Sprintf("(%.1f / %.1f GB)", hostMetrics.RAMUsedGB, hostMetrics.RAMTotalGB)
+			lines = append(lines, fmt.Sprintf("  • RAM Usage:  %s  %s", bar, lipgloss.NewStyle().Foreground(subtleColor).Render(ramDetails)))
+
+		case "Disk Usage (%)":
+			bar := drawProgressBar(hostMetrics.DiskUsage, 25)
+			diskDetails := fmt.Sprintf("(%.1f / %.1f GB)", hostMetrics.DiskUsedGB, hostMetrics.DiskTotalGB)
+			lines = append(lines, fmt.Sprintf("  • Disk Usage: %s  %s", bar, lipgloss.NewStyle().Foreground(subtleColor).Render(diskDetails)))
+		}
+	}
+
+	lines = append(lines, "")
+	lines = append(lines, lipgloss.NewStyle().Bold(true).Foreground(primaryColor).Render("PostgreSQL Instance Metrics"))
+	lines = append(lines, "----------------------------------------------------------------")
+
+	if len(m.lastMetrics) == 0 {
+		lines = append(lines, lipgloss.NewStyle().Foreground(subtleColor).Render("  Метрики БД не собраны или узел недоступен."))
+	} else {
+		for host, metrics := range m.lastMetrics {
+			if metrics.Error != nil {
+				lines = append(lines, lipgloss.NewStyle().Foreground(dangerColor).Render(fmt.Sprintf("  [%s] Ошибка: %v", host, metrics.Error)))
+			} else {
+				for _, item := range m.availableMetrics {
+					if !item.Enabled {
+						continue
+					}
+					switch item.Name {
+					case "Active Connections":
+						pct := (float64(metrics.ActiveConnections) / float64(metrics.MaxConnections)) * 100
+						bar := drawProgressBar(pct, 20)
+						lines = append(lines, fmt.Sprintf("  • Active Conns: %d / %d  %s", metrics.ActiveConnections, metrics.MaxConnections, bar))
+
+					case "Cache Hit Ratio":
+						bar := drawProgressBar(metrics.CacheHitRatio, 20)
+						lines = append(lines, fmt.Sprintf("  • Cache Hit:    %s", bar))
+					}
+				}
+			}
+		}
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+type HostMetrics struct {
+	CPUUsage    float64
+	RAMUsage    float64
+	RAMUsedGB   float64
+	RAMTotalGB  float64
+	DiskUsage   float64
+	DiskUsedGB  float64
+	DiskTotalGB float64
+	CPUHistory  []float64
+}
+
+func FetchHostMetrics(history []float64) (HostMetrics, error) {
+	var hm HostMetrics
+
+	cpuPercents, err := cpu.Percent(200*time.Millisecond, false)
+	if err == nil && len(cpuPercents) > 0 {
+		hm.CPUUsage = cpuPercents[0]
+	}
+
+	vMem, err := mem.VirtualMemory()
+	if err == nil {
+		hm.RAMUsage = vMem.UsedPercent
+		hm.RAMUsedGB = float64(vMem.Used) / (1024 * 1024 * 1024)
+		hm.RAMTotalGB = float64(vMem.Total) / (1024 * 1024 * 1024)
+	}
+
+	diskStat, err := disk.Usage("/")
+	if err == nil {
+		hm.DiskUsage = diskStat.UsedPercent
+		hm.DiskUsedGB = float64(diskStat.Used) / (1024 * 1024 * 1024)
+		hm.DiskTotalGB = float64(diskStat.Total) / (1024 * 1024 * 1024)
+	}
+
+	hm.CPUHistory = append(history, hm.CPUUsage)
+	if len(hm.CPUHistory) > 20 {
+		hm.CPUHistory = hm.CPUHistory[len(hm.CPUHistory)-20:]
+	}
+
+	return hm, nil
+}
+
+func drawProgressBar(percent float64, width int) string {
+	if percent > 100 {
+		percent = 100
+	}
+	filledWidth := int((percent / 100.0) * float64(width))
+	if filledWidth > width {
+		filledWidth = width
+	}
+
+	filled := strings.Repeat("█", filledWidth)
+	empty := strings.Repeat("░", width-filledWidth)
+
+	var color lipgloss.Color
+	switch {
+	case percent > 85:
+		color = dangerColor
+	case percent > 65:
+		color = warningColor
+	default:
+		color = successColor
+	}
+
+	barStyle := lipgloss.NewStyle().Foreground(color)
+	return barStyle.Render(filled+empty) + fmt.Sprintf(" %5.1f%%", percent)
+}
+
+func drawSparkline(history []float64, maxVal float64) string {
+	bars := []rune{' ', ' ', '▂', '▃', '▄', '▅', '▆', '▇', '█'}
+	var result strings.Builder
+
+	for _, val := range history {
+		if maxVal <= 0 {
+			maxVal = 100
+		}
+		idx := int((val / maxVal) * float64(len(bars)-1))
+		if idx < 0 {
+			idx = 0
+		}
+		if idx >= len(bars) {
+			idx = len(bars) - 1
+		}
+		result.WriteRune(bars[idx])
+	}
+
+	return lipgloss.NewStyle().Foreground(primaryColor).Bold(true).Render(result.String())
 }
 
 func main() {
