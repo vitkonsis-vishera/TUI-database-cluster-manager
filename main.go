@@ -776,7 +776,7 @@ func (m model) View() string {
 		containerWidth = 40
 	}
 
-	header := headerStyle.Render(" PG-CLUSTER TUI ") + "  " +
+	header := headerStyle.Render(" Wunschpunsch ") + "  " +
 		lipgloss.NewStyle().Foreground(primaryColor).Bold(true).Render("Engine: "+m.detectedEngine.String()) +
 		statusLineStyle.Render(" | Target: "+m.pgFlavor)
 
